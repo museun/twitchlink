@@ -1,32 +1,45 @@
-#[macro_use]
-extern crate failure;
 extern crate curl;
-extern crate serde;
-extern crate serde_json;
+extern crate getopts;
+extern crate json;
 
 use curl::easy::{Easy, List};
-use failure::Error;
-
-use std::{env, process, process::Command};
+use getopts::Options;
+use std::{env, fmt, process, process::Command};
 
 const CLIENT_ID: &str = env!("TWITCH_CLIENTID");
-const PLAYER: &str = r#"C:\Program Files\DAUM\PotPlayer\PotPlayerMini64.exe"#;
 
-fn parse_access_token(val: &serde_json::Value) -> Option<(&str, &str)> {
-    let token = match val.get("token") {
-        Some(token) if token.is_string() => token.as_str(),
-        _ => None,
-    };
+enum Error {
+    CannotGetResponse(curl::Error),
+    CannotParseJson(json::Error),
+    CannotParseAccessToken,
+    CannotParseResponse(std::string::FromUtf8Error),
+    CannotStartPlayer(std::io::Error),
+    IsOffline(String),
+}
 
-    let sig = match val.get("sig") {
-        Some(sig) if sig.is_string() => sig.as_str(),
-        _ => None,
-    };
-
-    if token.is_some() && sig.is_some() {
-        return Some((token.unwrap(), sig.unwrap()));
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
+        match self {
+            Error::CannotGetResponse(e) => write!(f, "cannot get response: {}", e),
+            Error::CannotParseJson(e) => write!(f, "cannot parse json: {}", e),
+            Error::CannotParseAccessToken => write!(f, "cannot parse access token"),
+            Error::CannotParseResponse(e) => write!(f, "cannot parse response: {}", e),
+            Error::CannotStartPlayer(e) => write!(f, "cannot start player: {}", e),
+            Error::IsOffline(ch) => write!(f, "{} is offline", ch),
+        }
     }
-    None
+}
+
+fn parse_access_token(val: &json::JsonValue) -> Option<(&str, &str)> {
+    if !val["token"].is_string() {
+        return None;
+    }
+
+    if !val["sig"].is_string() {
+        return None;
+    }
+
+    Some((val["token"].as_str().unwrap(), val["sig"].as_str().unwrap()))
 }
 
 fn build_query(token: &str, sig: &str) -> String {
@@ -66,9 +79,8 @@ fn get_response(easy: &mut curl::easy::Easy) -> Result<Vec<u8>, Error> {
                 resp.extend_from_slice(data);
                 Ok(data.len())
             })
-            .unwrap();
-
-        transfer.perform().unwrap();
+            .map_err(Error::CannotGetResponse)?;
+        transfer.perform().map_err(Error::CannotGetResponse)?;
     }
     Ok(resp)
 }
@@ -84,8 +96,9 @@ fn get_playlist(channel: &str) -> Result<String, Error> {
     )).unwrap();
 
     let resp = get_response(&mut easy)?;
-    let json = serde_json::from_slice(&resp)?;
-    let at = parse_access_token(&json).ok_or_else(|| format_err!("cannot get access token"))?;
+    let resp = String::from_utf8(resp).map_err(Error::CannotParseResponse)?;
+    let json = json::parse(&resp).map_err(Error::CannotParseJson)?;
+    let at = parse_access_token(&json).ok_or_else(|| Error::CannotParseAccessToken)?;
 
     easy.url(&format!(
         "https://usher.ttvnw.net/api/channel/hls/{}.m3u8{}",
@@ -94,9 +107,15 @@ fn get_playlist(channel: &str) -> Result<String, Error> {
     )).unwrap();
 
     let resp = get_response(&mut easy)?;
-    Ok(String::from_utf8(resp)?)
+    Ok(String::from_utf8(resp).map_err(Error::CannotParseResponse)?)
 }
 
+struct Stream {
+    link: String,
+    quality: String,
+}
+
+// this needs to return a list of stream qualities
 fn get_stream(playlist: &str) -> Option<&str> {
     static PREFIX: &str = "VIDEO=";
 
@@ -130,32 +149,63 @@ fn get_stream(playlist: &str) -> Option<&str> {
     None
 }
 
-fn run() -> Result<(), failure::Error> {
-    let channel = {
-        let mut args = env::args();
-        if args.len() != 2 {
-            eprintln!("usage: {} <name>", args.nth(0).unwrap());
-            process::exit(-1);
-        }
-        let mut ch = args.nth(1).unwrap();
-        if ch.contains('/') {
-            ch = ch.split('/').last().unwrap().to_string();
-        }
-        ch
-    };
+fn print_usage(program: &str, opts: &Options) {
+    use std::process;
+    let brief = format!("usage: {} stream", program);
+    print!("{}", opts.usage(&brief));
+    process::exit(1);
+}
 
+fn run(json: bool, player: &str, channel: &str) -> Result<(), Error> {
     if let Some(stream) = get_stream(get_playlist(&channel)?.as_str()) {
-        if let Err(err) = Command::new(PLAYER).arg(&stream).spawn() {
-            return Err(format_err!("cannot start player: {}", err));
+        if json {
+            Ok(())?
+        }
+        if let Err(err) = Command::new(player).arg(&stream).spawn() {
+            Err(Error::CannotStartPlayer(err))?;
         }
         Ok(())
     } else {
-        Err(format_err!("{} is offline", channel))
+        Err(Error::IsOffline(channel.to_string()))
     }
 }
 
 fn main() {
-    if let Err(e) = run() {
+    const PLAYER: &str = r#"C:\Program Files\DAUM\PotPlayer\PotPlayerMini64.exe"#;
+
+    let args = env::args().collect::<Vec<_>>();
+    let program = args[0].clone();
+
+    let mut opts = Options::new();
+    opts.optflag("j", "json", "dumps stream link as json");
+    opts.optflag("h", "help", "prints this help menu");
+    opts.optopt(
+        "p",
+        "player",
+        "the player to use (assumes the player accepts the stream on stdin)",
+        "PLAYER",
+    );
+
+    let matches = opts.parse(&args[1..]).unwrap();
+    if matches.opt_present("h") {
+        print_usage(&program, &opts)
+    }
+
+    let json = matches.opt_present("j");
+    let player = matches.opt_get_default("p", PLAYER.to_string()).unwrap();
+
+    let channel = if !matches.free.is_empty() {
+        let mut ch = matches.free[0].clone();
+        if ch.contains('/') {
+            ch = ch.split('/').last().unwrap().to_string();
+        }
+        ch
+    } else {
+        print_usage(&program, &opts);
+        return;
+    };
+
+    if let Err(e) = run(json, &player, &channel) {
         eprintln!("failed: {}", e);
         process::exit(-1);
     }
