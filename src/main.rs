@@ -1,5 +1,6 @@
 extern crate curl;
 extern crate getopts;
+#[macro_use]
 extern crate json;
 
 use curl::easy::{Easy, List};
@@ -110,43 +111,97 @@ fn get_playlist(channel: &str) -> Result<String, Error> {
     Ok(String::from_utf8(resp).map_err(Error::CannotParseResponse)?)
 }
 
+#[derive(Debug)]
 struct Stream {
+    resolution: String,
+    bandwidth: String,
     link: String,
-    quality: String,
+    quality: i32,
 }
 
-// this needs to return a list of stream qualities
-fn get_stream(playlist: &str) -> Option<&str> {
-    static PREFIX: &str = "VIDEO=";
+impl From<Stream> for json::JsonValue {
+    fn from(stream: Stream) -> json::JsonValue {
+        let quality = if stream.quality == 9999 {
+            "best".to_string()
+        } else {
+            stream.quality.to_string() + "p"
+        };
+        object!{
+            "type" => quality,
+            "resolution" => stream.resolution,
+            "bandwidth" => stream.bandwidth,
+            "link" => stream.link,
+        }
+    }
+}
+
+fn get_streams(playlist: &str) -> Option<Vec<Stream>> {
+    static VIDEO: &str = "VIDEO=";
+    static RESOLUTION: &str = "RESOLUTION=";
+    static BANDWIDTH: &str = "BANDWIDTH=";
 
     use std::collections::BTreeMap;
     let mut map = BTreeMap::new();
 
     // TODO use an enum for this. probably.
     let mut quality = String::new();
+    let mut resolution = String::new();
+    let mut bandwidth = String::new();
 
     for line in playlist.lines() {
-        if line.contains(PREFIX) {
-            let &(index, _) = line.match_indices(PREFIX).collect::<Vec<_>>().first()?;
-            let offset = index + PREFIX.len();
+        if line.contains(VIDEO) {
+            // #EXT-X-STREAM-INF:PROGRAM-ID=1,BANDWIDTH=6874872,RESOLUTION=1920x1080,CODECS="avc1.4D402A,mp4a.40.2",VIDEO="chunked"
+            let &(index, _) = line.match_indices(VIDEO).collect::<Vec<_>>().first()?;
+            let offset = index + VIDEO.len();
             quality = line[offset..].replace("\"", "");
+
+            {
+                let pos = line.find(BANDWIDTH).unwrap();
+                let end = (&line[pos..].find(',')).unwrap() + pos;
+                bandwidth = line[pos + BANDWIDTH.len()..end].to_string();
+            }
+
+            {
+                let pos = line.find(RESOLUTION).unwrap();
+                let end = (&line[pos..].find(',')).unwrap() + pos;
+                resolution = line[pos + RESOLUTION.len()..end].to_string();
+            }
         }
         if quality.is_empty() || line.starts_with('#') {
             continue;
         }
         if quality == "chunked" {
-            map.insert(9999, line); // this is the source quality
+            map.insert(
+                9999,
+                Stream {
+                    link: line.to_string(),
+                    resolution: resolution.to_string(),
+                    bandwidth: bandwidth.to_string(),
+                    quality: 9999,
+                },
+            ); // this is the source quality
         } else if let Ok(q) = quality[..3].parse::<i32>() {
-            map.insert(q, line);
+            map.insert(
+                q,
+                Stream {
+                    link: line.to_string(),
+                    resolution: resolution.to_string(),
+                    bandwidth: bandwidth.to_string(),
+                    quality: q,
+                },
+            );
         }
+
+        resolution.clear();
+        bandwidth.clear();
         quality.clear();
     }
 
-    // get the last element, so the largest number
-    if let Some((_, v)) = map.iter().rev().next() {
-        return Some(v);
+    let mut res = vec![];
+    for (_, v) in map {
+        res.push(v)
     }
-    None
+    Some(res)
 }
 
 fn print_usage(program: &str, opts: &Options) {
@@ -157,11 +212,17 @@ fn print_usage(program: &str, opts: &Options) {
 }
 
 fn run(json: bool, player: &str, channel: &str) -> Result<(), Error> {
-    if let Some(stream) = get_stream(get_playlist(&channel)?.as_str()) {
-        if json {
-            Ok(())?
-        }
-        if let Err(err) = Command::new(player).arg(&stream).spawn() {
+    let streams = get_streams(get_playlist(&channel)?.as_str())
+        .ok_or_else(|| Error::IsOffline(channel.to_string()))?;
+
+    if json {
+        let data = json::stringify(streams);
+        println!("{}", data);
+        return Ok(());
+    }
+
+    if let Some(stream) = streams.iter().rev().next() {
+        if let Err(err) = Command::new(player).arg(&stream.link).spawn() {
             Err(Error::CannotStartPlayer(err))?;
         }
         Ok(())
