@@ -1,241 +1,155 @@
-extern crate curl;
-extern crate getopts;
-#[macro_use]
-extern crate json;
-
-use curl::easy::{Easy, List};
 use getopts::Options;
-use std::{env, fmt, process, process::Command};
+use serde::Serialize;
+use std::env;
 
-const CLIENT_ID: &str = env!("TWITCH_CLIENTID");
-
-enum Error {
-    CannotGetResponse(curl::Error),
-    CannotParseJson(json::Error),
-    CannotParseAccessToken,
-    CannotParseResponse(std::string::FromUtf8Error),
-    CannotStartPlayer(std::io::Error),
-    IsOffline(String),
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
-        match self {
-            Error::CannotGetResponse(e) => write!(f, "cannot get response: {}", e),
-            Error::CannotParseJson(e) => write!(f, "cannot parse json: {}", e),
-            Error::CannotParseAccessToken => write!(f, "cannot parse access token"),
-            Error::CannotParseResponse(e) => write!(f, "cannot parse response: {}", e),
-            Error::CannotStartPlayer(e) => write!(f, "cannot start player: {}", e),
-            Error::IsOffline(ch) => write!(f, "{} is offline", ch),
-        }
-    }
-}
-
-fn parse_access_token(val: &json::JsonValue) -> Option<(&str, &str)> {
-    if !val["token"].is_string() {
-        return None;
-    }
-
-    if !val["sig"].is_string() {
-        return None;
-    }
-
-    Some((val["token"].as_str().unwrap(), val["sig"].as_str().unwrap()))
-}
-
-fn build_query(token: &str, sig: &str) -> String {
-    fn encode(data: &str) -> String {
-        let mut res = String::new();
-        for ch in data.as_bytes().iter() {
-            match *ch as char {
-                'A'...'Z' | 'a'...'z' | '0'...'9' | '-' | '_' | '.' | '~' => res.push(*ch as char),
-                ch => res.push_str(format!("%{:02X}", ch as u32).as_str()),
-            }
-        }
-        res
-    }
-
-    let map = &[
-        ("token", token),
-        ("sig", sig),
-        ("player_backend", "html5"),
-        ("player", "twitchweb"),
-        ("type", "any"),
-        ("allow_source", "true"),
-    ];
-
-    let mut query = String::from("?");
-    for (k, v) in map {
-        query.push_str(&format!("{}={}&", encode(k), encode(v),));
-    }
-    query
-}
-
-fn get_response(easy: &mut curl::easy::Easy) -> Result<Vec<u8>, Error> {
-    let mut resp = vec![];
-    {
-        let mut transfer = easy.transfer();
-        transfer
-            .write_function(|data| {
-                resp.extend_from_slice(data);
-                Ok(data.len())
-            })
-            .map_err(Error::CannotGetResponse)?;
-        transfer.perform().map_err(Error::CannotGetResponse)?;
-    }
-    Ok(resp)
-}
-
-fn get_playlist(channel: &str) -> Result<String, Error> {
-    let mut easy = Easy::new();
-    let mut list = List::new();
-    list.append(&format!("Client-ID: {}", CLIENT_ID)).unwrap();
-    easy.http_headers(list).unwrap();
-    easy.url(&format!(
-        "https://api.twitch.tv/api/channels/{}/access_token",
-        channel
-    )).unwrap();
-
-    let resp = get_response(&mut easy)?;
-    let resp = String::from_utf8(resp).map_err(Error::CannotParseResponse)?;
-    let json = json::parse(&resp).map_err(Error::CannotParseJson)?;
-    let at = parse_access_token(&json).ok_or_else(|| Error::CannotParseAccessToken)?;
-
-    easy.url(&format!(
-        "https://usher.ttvnw.net/api/channel/hls/{}.m3u8{}",
-        channel,
-        build_query(at.0, at.1)
-    )).unwrap();
-
-    let resp = get_response(&mut easy)?;
-    Ok(String::from_utf8(resp).map_err(Error::CannotParseResponse)?)
-}
-
-#[derive(Debug)]
+#[derive(Debug, Serialize, PartialEq, PartialOrd, Eq, Ord)]
 struct Stream {
     resolution: String,
     bandwidth: String,
     link: String,
+    #[serde(skip)]
     quality: i32,
+    #[serde(rename = "type")]
+    ty: String,
 }
 
-impl From<Stream> for json::JsonValue {
-    fn from(stream: Stream) -> json::JsonValue {
-        let quality = if stream.quality == 9999 {
-            "best".to_string()
-        } else {
-            stream.quality.to_string() + "p"
+impl Stream {
+    pub fn get(channel: &str) -> Result<Vec<Self>, String> {
+        let playlist = Self::playlist(channel)?;
+
+        static VIDEO: &str = "VIDEO=";
+        static RESOLUTION: &str = "RESOLUTION=";
+        static BANDWIDTH: &str = "BANDWIDTH=";
+
+        let mut map = std::collections::HashMap::new();
+
+        // TODO look at this. this shouldn't be done like this
+
+        let mut quality = String::new();
+        let mut resolution = String::new();
+        let mut bandwidth = String::new();
+
+        for line in playlist.lines() {
+            if line.contains(VIDEO) {
+                // #EXT-X-STREAM-INF:PROGRAM-ID=1,BANDWIDTH=6874872,RESOLUTION=1920x1080,CODECS="avc1.4D402A,mp4a.40.2",VIDEO="chunked"
+                let (index, _) = line
+                    .match_indices(VIDEO)
+                    .next()
+                    .ok_or_else(|| format!("cannot parse playlist for `{}`", channel))?;
+
+                let offset = index + VIDEO.len();
+                quality = line[offset..].replace("\"", "");
+
+                {
+                    let pos = line.find(BANDWIDTH).unwrap();
+                    let end = (&line[pos..].find(',')).unwrap() + pos;
+                    bandwidth = line[pos + BANDWIDTH.len()..end].to_string();
+                }
+
+                {
+                    let pos = line.find(RESOLUTION).unwrap();
+                    let end = (&line[pos..].find(',')).unwrap() + pos;
+                    resolution = line[pos + RESOLUTION.len()..end].to_string();
+                }
+            }
+            if quality.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if quality == "chunked" {
+                map.insert(
+                    9999,
+                    Stream {
+                        link: line.to_string(),
+                        resolution: resolution.to_string(),
+                        bandwidth: bandwidth.to_string(),
+                        quality: 9999,
+                        ty: "best".into(),
+                    },
+                ); // this is the source quality
+            } else if let Ok(q) = quality[..3].parse::<i32>() {
+                map.insert(
+                    q,
+                    Stream {
+                        link: line.to_string(),
+                        resolution: resolution.to_string(),
+                        bandwidth: bandwidth.to_string(),
+                        quality: q,
+                        ty: format!("{}p", q),
+                    },
+                );
+            }
+
+            // what is this doing?
+            // not sure if we can drain instead, this might be partial data
+            resolution.clear();
+            bandwidth.clear();
+            quality.clear();
+        }
+
+        let mut list = map.drain().map(|(_, v)| v).collect::<Vec<_>>();
+        list.sort_unstable_by(|a, b| b.quality.cmp(&a.quality));
+        Ok(list)
+    }
+
+    fn playlist(channel: &str) -> Result<String, String> {
+        let resp = ureq::get(&format!(
+            "https://api.twitch.tv/api/channels/{}/access_token",
+            channel
+        ))
+        .set(
+            "Client-ID",
+            &env::var("TWITCH_CLIENT_ID").map_err(|_| "TWITCH_CLIENT_ID is not set")?,
+        )
+        .call();
+
+        if let Some(err) = resp.synthetic_error() {
+            return Err(err.status_text().into());
+        }
+
+        let val: serde_json::Value =
+            serde_json::from_reader(resp.into_reader()).map_err(|err| err.to_string())?;
+
+        let (token, sig) = match (
+            val.get("token").and_then(serde_json::Value::as_str),
+            val.get("sig").and_then(serde_json::Value::as_str),
+        ) {
+            (Some(token), Some(sig)) => (token, sig),
+            (None, ..) => return Err(format!("cannot get token for: {}", channel)),
+            (.., None) => return Err(format!("cannot get sig for: {}", channel)),
         };
-        object!{
-            "type" => quality,
-            "resolution" => stream.resolution,
-            "bandwidth" => stream.bandwidth,
-            "link" => stream.link,
+
+        let mut req = ureq::get(&format!(
+            "https://usher.ttvnw.net/api/channel/hls/{}.m3u8",
+            channel,
+        ));
+
+        for (k, v) in &[
+            ("token", token),
+            ("sig", sig),
+            ("player_backend", "html5"),
+            ("player", "twitchweb"),
+            ("type", "any"),
+            ("allow_source", "true"),
+        ] {
+            req = req.query(k, v).build()
         }
+
+        let resp = req.call();
+        if let Some(err) = resp.synthetic_error() {
+            return Err(err.status_text().into());
+        }
+
+        resp.into_string().map_err(|err| err.to_string())
     }
 }
 
-fn get_streams(playlist: &str) -> Option<Vec<Stream>> {
-    static VIDEO: &str = "VIDEO=";
-    static RESOLUTION: &str = "RESOLUTION=";
-    static BANDWIDTH: &str = "BANDWIDTH=";
-
-    use std::collections::BTreeMap;
-    let mut map = BTreeMap::new();
-
-    // TODO use an enum for this. probably.
-    let mut quality = String::new();
-    let mut resolution = String::new();
-    let mut bandwidth = String::new();
-
-    for line in playlist.lines() {
-        if line.contains(VIDEO) {
-            // #EXT-X-STREAM-INF:PROGRAM-ID=1,BANDWIDTH=6874872,RESOLUTION=1920x1080,CODECS="avc1.4D402A,mp4a.40.2",VIDEO="chunked"
-            let &(index, _) = line.match_indices(VIDEO).collect::<Vec<_>>().first()?;
-            let offset = index + VIDEO.len();
-            quality = line[offset..].replace("\"", "");
-
-            {
-                let pos = line.find(BANDWIDTH).unwrap();
-                let end = (&line[pos..].find(',')).unwrap() + pos;
-                bandwidth = line[pos + BANDWIDTH.len()..end].to_string();
-            }
-
-            {
-                let pos = line.find(RESOLUTION).unwrap();
-                let end = (&line[pos..].find(',')).unwrap() + pos;
-                resolution = line[pos + RESOLUTION.len()..end].to_string();
-            }
-        }
-        if quality.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if quality == "chunked" {
-            map.insert(
-                9999,
-                Stream {
-                    link: line.to_string(),
-                    resolution: resolution.to_string(),
-                    bandwidth: bandwidth.to_string(),
-                    quality: 9999,
-                },
-            ); // this is the source quality
-        } else if let Ok(q) = quality[..3].parse::<i32>() {
-            map.insert(
-                q,
-                Stream {
-                    link: line.to_string(),
-                    resolution: resolution.to_string(),
-                    bandwidth: bandwidth.to_string(),
-                    quality: q,
-                },
-            );
-        }
-
-        resolution.clear();
-        bandwidth.clear();
-        quality.clear();
-    }
-
-    let mut res = vec![];
-    for (_, v) in map {
-        res.push(v)
-    }
-    Some(res)
-}
-
-fn print_usage(program: &str, opts: &Options) {
-    use std::process;
-    let brief = format!("usage: {} stream", program);
-    print!("{}", opts.usage(&brief));
-    process::exit(1);
-}
-
-fn run(json: bool, player: &str, channel: &str) -> Result<(), Error> {
-    let streams = get_streams(get_playlist(&channel)?.as_str())
-        .ok_or_else(|| Error::IsOffline(channel.to_string()))?;
-
-    if json {
-        let data = json::stringify(streams);
-        println!("{}", data);
-        return Ok(());
-    }
-
-    if let Some(stream) = streams.iter().rev().next() {
-        if let Err(err) = Command::new(player).arg(&stream.link).spawn() {
-            Err(Error::CannotStartPlayer(err))?;
-        }
-        Ok(())
-    } else {
-        Err(Error::IsOffline(channel.to_string()))
-    }
-}
-
-fn main() {
+fn main() -> Result<(), String> {
     const PLAYER: &str = r#"C:\Program Files\DAUM\PotPlayer\PotPlayerMini64.exe"#;
 
-    let args = env::args().collect::<Vec<_>>();
-    let program = args[0].clone();
+    let (program, args) = {
+        let mut args = env::args();
+        (args.next().unwrap(), args.collect::<Vec<_>>())
+    };
 
     let mut opts = Options::new();
     opts.optflag("j", "json", "dumps stream link as json");
@@ -247,27 +161,40 @@ fn main() {
         "PLAYER",
     );
 
-    let matches = opts.parse(&args[1..]).unwrap();
-    if matches.opt_present("h") {
+    let matches = opts.parse(&args).unwrap();
+    if matches.opt_present("h") || matches.free.is_empty() {
         print_usage(&program, &opts)
     }
 
     let json = matches.opt_present("j");
-    let player = matches.opt_get_default("p", PLAYER.to_string()).unwrap();
+    let player = matches.opt_get_default("p", PLAYER.to_owned()).unwrap();
 
-    let channel = if !matches.free.is_empty() {
-        let mut ch = matches.free[0].clone();
-        if ch.contains('/') {
-            ch = ch.split('/').last().unwrap().to_string();
-        }
-        ch
+    let channel = &matches.free[0];
+    let channel = if channel.contains('/') {
+        channel.split('/').last().unwrap()
     } else {
-        print_usage(&program, &opts);
-        return;
+        channel
     };
 
-    if let Err(e) = run(json, &player, &channel) {
-        eprintln!("failed: {}", e);
-        process::exit(-1);
+    let streams = Stream::get(&channel)?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&streams).unwrap());
+        return Ok(());
     }
+
+    let stream = streams
+        .last()
+        .ok_or_else(|| format!("stream `{}` is offline", channel))?;
+
+    std::process::Command::new(player)
+        .arg(&stream.link)
+        .spawn()
+        .map_err(|err| format!("cannot start stream `{}`: {}", channel, err))
+        .map(|_| ())
+}
+
+fn print_usage(program: &str, opts: &Options) -> ! {
+    print!("{}", opts.usage(&format!("usage: {} stream", program)));
+    std::process::exit(1);
 }
