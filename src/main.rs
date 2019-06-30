@@ -1,35 +1,89 @@
-use getopts::Options;
+use gumdrop::Options;
 use serde::Serialize;
+use std::collections::HashMap;
 
-#[derive(Debug, Serialize, PartialEq, PartialOrd, Eq, Ord)]
-struct Stream {
-    resolution: String,
-    bandwidth: String,
-    link: String,
-    #[serde(skip)]
-    quality: Option<u32>,
-    #[serde(rename = "type")]
-    ty: String,
+#[derive(Debug)]
+pub enum Error {
+    GetAccessToken(String, attohttpc::Error),
+    Deserialize(String, attohttpc::Error),
+    GetPlaylist(String, attohttpc::Error),
+    GetResponseBody(String, attohttpc::Error),
+    InvalidPlaylist(String),
+    FindToken(String),
+    FindSignature(String),
 }
 
-impl Stream {
-    pub fn get(channel: &str) -> Result<Vec<Self>, String> {
-        let playlist = Self::playlist(channel)?;
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::GetAccessToken(_, err)
+            | Error::Deserialize(_, err)
+            | Error::GetPlaylist(_, err)
+            | Error::GetResponseBody(_, err) => Some(err),
+            _ => None,
+        }
+    }
+}
 
-        static VIDEO: &str = "VIDEO=";
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::GetAccessToken(channel, err) => write!(
+                f,
+                "cannot get access token for `{}` because: {}",
+                channel, err
+            ),
+            Error::Deserialize(channel, err) => write!(
+                f,
+                "cannot get deserialize response for `{}` because: {}",
+                channel, err
+            ),
+            Error::GetPlaylist(channel, err) => {
+                write!(f, "cannot get playlist for `{}` because: {}", channel, err)
+            }
+            Error::GetResponseBody(channel, err) => write!(
+                f,
+                "cannot get get response body for `{}` because: {}",
+                channel, err
+            ),
 
-        let mut map = std::collections::HashMap::new();
+            Error::InvalidPlaylist(channel) => write!(f, "invalid player for `{}`", channel),
+
+            Error::FindToken(channel) => write!(f, "cannot find token for `{}`", channel),
+            Error::FindSignature(channel) => write!(f, "cannot find signature for `{}`", channel),
+        }
+    }
+}
+
+pub struct Client {
+    pub client_id: String,
+}
+
+impl Client {
+    pub fn new(id: impl ToString) -> Self {
+        Self {
+            client_id: id.to_string(),
+        }
+    }
+
+    pub fn get(&self, channel: impl AsRef<str>) -> Result<Vec<Stream>, Error> {
+        let channel = channel.as_ref();
+        let playlist = self.fetch_playlist(channel)?;
+
+        let mut map = HashMap::new();
+
+        // why
         let (mut quality, mut resolution, mut bandwidth) =
             (String::new(), String::new(), String::new());
 
         for line in playlist.lines() {
-            if line.contains(VIDEO) {
+            if line.contains("VIDEO=") {
                 let (index, _) = line
-                    .match_indices(VIDEO)
+                    .match_indices("VIDEO=")
                     .next()
-                    .ok_or_else(|| format!("cannot parse playlist for `{}`", channel))?;
+                    .ok_or_else(|| Error::InvalidPlaylist(channel.to_string()))?;
 
-                quality = line[index + VIDEO.len()..].replace("\"", "");
+                quality = line[index + "VIDEO=".len()..].replace("\"", "");
 
                 let search = |q: &str| {
                     let pos = line.find(q).unwrap();
@@ -48,20 +102,20 @@ impl Stream {
             let s = match (quality.as_str(), quality[..3].parse::<u32>()) {
                 ("chunked", ..) => Stream {
                     link: line.to_string(),
-                    resolution: resolution.drain(..).collect(),
-                    bandwidth: bandwidth.drain(..).collect(),
+                    resolution: std::mem::replace(&mut resolution, String::new()),
+                    bandwidth: std::mem::replace(&mut bandwidth, String::new()),
                     quality: None,
                     ty: "best".into(),
                 },
                 (.., Ok(n)) => Stream {
                     link: line.to_string(),
-                    resolution: resolution.drain(..).collect(),
-                    bandwidth: bandwidth.drain(..).collect(),
+                    resolution: std::mem::replace(&mut resolution, String::new()),
+                    bandwidth: std::mem::replace(&mut bandwidth, String::new()),
                     quality: Some(n),
                     ty: format!("{}p", n),
                 },
                 (s, ..) => {
-                    eprintln!("unknown quality: {}", s);
+                    eprintln!("WARN: unknown quality: {}", s);
                     quality.clear();
                     continue;
                 }
@@ -80,110 +134,230 @@ impl Stream {
         Ok(list)
     }
 
-    fn playlist(channel: &str) -> Result<String, String> {
-        let resp = ureq::get(&format!(
+    fn fetch_playlist(&self, channel: &str) -> Result<String, Error> {
+        let val: serde_json::Value = attohttpc::get(format!(
             "https://api.twitch.tv/api/channels/{}/access_token",
             channel
         ))
-        .set(
-            "Client-ID",
-            &std::env::var("TWITCH_CLIENT_ID").map_err(|_| "TWITCH_CLIENT_ID is not set")?,
-        )
-        .call();
-
-        if let Some(err) = resp.synthetic_error() {
-            return Err(err.status_text().into());
-        }
-
-        let val: serde_json::Value =
-            serde_json::from_reader(resp.into_reader()).map_err(|err| err.to_string())?;
+        .header("Client-ID", self.client_id.clone())
+        .send()
+        .map_err(|err| Error::GetAccessToken(channel.to_string(), err))?
+        .json()
+        .map_err(|err| Error::Deserialize(channel.to_string(), err))?;
 
         let (token, sig) = match (
             val.get("token").and_then(serde_json::Value::as_str),
             val.get("sig").and_then(serde_json::Value::as_str),
         ) {
             (Some(token), Some(sig)) => (token, sig),
-            (None, ..) => return Err(format!("cannot get token for: {}", channel)),
-            (.., None) => return Err(format!("cannot get sig for: {}", channel)),
+            (None, ..) => return Err(Error::FindToken(channel.to_string())),
+            (.., None) => return Err(Error::FindSignature(channel.to_string())),
         };
 
-        let mut req = ureq::get(&format!(
+        attohttpc::get(format!(
             "https://usher.ttvnw.net/api/channel/hls/{}.m3u8",
             channel,
-        ));
-
-        for (k, v) in &[
+        ))
+        .params(&[
             ("token", token),
             ("sig", sig),
             ("player_backend", "html5"),
             ("player", "twitchweb"),
             ("type", "any"),
             ("allow_source", "true"),
-        ] {
-            req = req.query(k, v).build()
-        }
-
-        let resp = req.call();
-        if let Some(err) = resp.synthetic_error() {
-            return Err(err.status_text().into());
-        }
-
-        resp.into_string().map_err(|err| err.to_string())
+        ])
+        .send()
+        .map_err(|err| Error::GetPlaylist(channel.to_string(), err))?
+        .text()
+        .map_err(|err| Error::GetResponseBody(channel.to_string(), err))
     }
 }
 
-fn main() -> Result<(), String> {
-    const PLAYER: &str = r#"C:\Program Files\DAUM\PotPlayer\PotPlayerMini64.exe"#;
+#[derive(Debug, Clone, Serialize, PartialEq, PartialOrd, Eq, Ord)]
+pub struct Stream {
+    pub resolution: String,
 
-    let (program, args) = {
-        let mut args = std::env::args();
-        (args.next().unwrap(), args.collect::<Vec<_>>())
-    };
+    pub bandwidth: String,
 
-    let mut opts = Options::new();
-    opts.optflag("j", "json", "dumps stream link as json");
-    opts.optflag("h", "help", "prints this help menu");
-    opts.optopt(
-        "p",
-        "player",
-        "the player to use (assumes the player accepts the stream on stdin)",
-        "PLAYER",
-    );
+    pub link: String,
 
-    let matches = opts.parse(&args).unwrap();
-    if matches.opt_present("h") || matches.free.is_empty() {
-        print_usage(&program, &opts)
+    #[serde(skip)]
+    pub quality: Option<u32>,
+
+    #[serde(rename = "type")]
+    pub ty: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Quality {
+    Best,
+    Lowest,
+    Custom(String),
+}
+
+impl std::str::FromStr for Quality {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let input = s.to_ascii_lowercase();
+        let ok = match input.as_str() {
+            "best" | "highest" => Quality::Best,
+            "worst" | "lowest " => Quality::Lowest,
+            _ => Quality::Custom(input), // try parsing this maybe
+        };
+        Ok(ok)
     }
+}
 
-    let json = matches.opt_present("j");
-    let player = matches.opt_get_default("p", PLAYER.to_owned()).unwrap();
+#[derive(Options, Debug, Clone)]
+pub struct Args {
+    #[options(help = "display this message")]
+    help: bool,
 
-    let channel = &matches.free[0];
-    let channel = if channel.contains('/') {
-        channel.split('/').last().unwrap()
+    #[options(help = "dumps the stream information as json")]
+    json: bool,
+
+    #[options(help = "a player to use.")]
+    player: Option<String>,
+
+    #[options(help = "desired quality of the stream")]
+    quality: Option<Quality>,
+
+    #[options(help = "list stream quality information")]
+    list: bool,
+
+    #[options(required, free, help = "the stream to fetch")]
+    stream: String,
+}
+
+fn main() {
+    let player = std::env::var("STREAMLINK_PLAYER")
+        .ok()
+        .unwrap_or_else(|| "mpv".to_string());
+
+    // TODO show the version
+    let args = Args::parse_args_default_or_exit();
+
+    let player = args.player.unwrap_or_else(|| player.to_string());
+
+    let channel = if args.stream.contains('/') {
+        args.stream.split('/').last().unwrap()
     } else {
-        channel
+        args.stream.as_str()
     };
 
-    let streams = Stream::get(&channel)?;
+    let id = std::env::var("TWITCH_CLIENT_ID")
+        .abort(|_| "env. var 'TWITCH_CLIENT_ID' must be set to your client id".to_string());
 
-    if json {
-        println!("{}", serde_json::to_string_pretty(&streams).unwrap());
-        return Ok(());
+    let client = Client::new(id);
+    let streams = client.get(&channel).abort(|err| err.to_string());
+
+    let singular = args.quality.is_some();
+
+    let quality = args.quality.unwrap_or_else(|| Quality::Best);
+    let stream = match quality {
+        Quality::Best => streams
+            .first()
+            .abort(|_| format!("stream `{}` is offline", channel)),
+
+        Quality::Lowest => streams
+            .last()
+            .abort(|_| format!("stream `{}` is offline", channel)),
+
+        Quality::Custom(mut s) => {
+            if !s.ends_with('p') {
+                s.push('p');
+            }
+            streams
+                .iter()
+                .find(|stream| stream.ty == *s)
+                .abort(|_| format!("quality `{}` is not available for stream `{}` ", s, channel))
+        }
+    };
+
+    if args.json && !args.list {
+        let s = if !singular {
+            serde_json::to_string_pretty(&streams).unwrap()
+        } else {
+            serde_json::to_string_pretty(&stream).unwrap()
+        };
+        println!("{}", s);
+        return;
     }
 
-    let stream = streams
-        .first()
-        .ok_or_else(|| format!("stream `{}` is offline", channel))?;
+    match (args.json, args.list, singular) {
+        (false, true, false) => streams
+            .into_iter()
+            .map(Item::from)
+            .for_each(|k| println!("{}", k)),
 
-    std::process::Command::new(player)
-        .arg(&stream.link)
-        .spawn()
-        .map_err(|err| format!("cannot start stream `{}`: {}", channel, err))
-        .map(|_| ())
+        (false, true, true) => println!("{}", Item::from(stream.clone())),
+
+        (true, true, true) => println!(
+            "{}",
+            serde_json::to_string_pretty(&Item::from(stream.clone())).unwrap()
+        ),
+
+        (true, true, false) => println!(
+            "{}",
+            serde_json::to_string_pretty(
+                &streams.into_iter().map(Item::from).collect::<Vec<_>>() //
+            )
+            .unwrap()
+        ),
+
+        _ => std::process::Command::new(player)
+            .arg(&stream.link)
+            .spawn()
+            .map(|_| ())
+            .abort(|err| format!("cannot start stream `{}`: {}", channel, err)),
+    }
 }
 
-fn print_usage(program: &str, opts: &Options) -> ! {
-    print!("{}", opts.usage(&format!("usage: {} <stream>", program)));
-    std::process::exit(1);
+#[derive(Serialize)]
+struct Item {
+    quality: String,
+    resolution: String,
+    bitrate: String,
+}
+
+impl From<Stream> for Item {
+    fn from(s: Stream) -> Self {
+        Item {
+            quality: s.ty,
+            resolution: s.resolution,
+            bitrate: s.bandwidth,
+        }
+    }
+}
+
+impl std::fmt::Display for Item {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "[{}] {: >10} @ {: >8.2} kbps",
+            self.quality,
+            self.resolution,
+            self.bitrate.parse::<f64>().unwrap() / 1024.
+        )
+    }
+}
+trait Abort<T, E = ()> {
+    fn abort<F: FnOnce(E) -> String>(self, f: F) -> T;
+}
+
+impl<T, E: std::fmt::Display> Abort<T, E> for Result<T, E> {
+    fn abort<F: FnOnce(E) -> String>(self, f: F) -> T {
+        self.unwrap_or_else(|err| {
+            eprintln!("{}", f(err));
+            std::process::exit(1);
+        })
+    }
+}
+impl<T> Abort<T, ()> for Option<T> {
+    fn abort<F: FnOnce(()) -> String>(self, f: F) -> T {
+        self.unwrap_or_else(|| {
+            eprintln!("{}", f(()));
+            std::process::exit(1);
+        })
+    }
 }
