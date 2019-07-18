@@ -276,9 +276,9 @@ fn main() {
 
     if args.json && !args.list {
         let s = if !singular {
-            serde_json::to_string_pretty(&streams).unwrap()
+            serde_json::to_string(&streams).unwrap()
         } else {
-            serde_json::to_string_pretty(&stream).unwrap()
+            serde_json::to_string(&stream).unwrap()
         };
         println!("{}", s);
         return;
@@ -294,12 +294,12 @@ fn main() {
 
         (true, true, true) => println!(
             "{}",
-            serde_json::to_string_pretty(&Item::from(stream.clone())).unwrap()
+            serde_json::to_string(&Item::from(stream.clone())).unwrap()
         ),
 
         (true, true, false) => println!(
             "{}",
-            serde_json::to_string_pretty(
+            serde_json::to_string(
                 &streams.into_iter().map(Item::from).collect::<Vec<_>>() //
             )
             .unwrap()
@@ -341,6 +341,7 @@ impl std::fmt::Display for Item {
         )
     }
 }
+
 trait Abort<T, E = ()> {
     fn abort<F: FnOnce(E) -> String>(self, f: F) -> T;
 }
