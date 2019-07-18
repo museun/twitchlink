@@ -3,7 +3,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 
 #[derive(Debug)]
-pub enum Error {
+enum Error {
     GetAccessToken(String, attohttpc::Error),
     Deserialize(String, attohttpc::Error),
     GetPlaylist(String, attohttpc::Error),
@@ -55,18 +55,18 @@ impl std::fmt::Display for Error {
     }
 }
 
-pub struct Client {
-    pub client_id: String,
+struct Client {
+    client_id: String,
 }
 
 impl Client {
-    pub fn new(id: impl ToString) -> Self {
+    fn new(id: impl ToString) -> Self {
         Self {
             client_id: id.to_string(),
         }
     }
 
-    pub fn get(&self, channel: impl AsRef<str>) -> Result<Vec<Stream>, Error> {
+    fn get(&self, channel: impl AsRef<str>) -> Result<Vec<Stream>, Error> {
         let channel = channel.as_ref();
         let playlist = self.fetch_playlist(channel)?;
 
@@ -174,22 +174,18 @@ impl Client {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, PartialOrd, Eq, Ord)]
-pub struct Stream {
-    pub resolution: String,
-
-    pub bandwidth: String,
-
-    pub link: String,
-
+struct Stream {
+    resolution: String,
+    bandwidth: String,
+    link: String,
     #[serde(skip)]
-    pub quality: Option<u32>,
-
+    quality: Option<u32>,
     #[serde(rename = "type")]
-    pub ty: String,
+    ty: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum Quality {
+enum Quality {
     Best,
     Lowest,
     Custom(String),
@@ -205,111 +201,6 @@ impl std::str::FromStr for Quality {
             _ => Quality::Custom(input), // try parsing this maybe
         };
         Ok(ok)
-    }
-}
-
-#[derive(Options, Debug, Clone)]
-pub struct Args {
-    #[options(help = "display this message")]
-    help: bool,
-
-    #[options(help = "dumps the stream information as json")]
-    json: bool,
-
-    #[options(help = "a player to use.")]
-    player: Option<String>,
-
-    #[options(help = "desired quality of the stream")]
-    quality: Option<Quality>,
-
-    #[options(help = "list stream quality information")]
-    list: bool,
-
-    #[options(required, free, help = "the stream to fetch")]
-    stream: String,
-}
-
-fn main() {
-    let player = std::env::var("STREAMLINK_PLAYER")
-        .ok()
-        .unwrap_or_else(|| "mpv".to_string());
-
-    // TODO show the version
-    let args = Args::parse_args_default_or_exit();
-
-    let player = args.player.unwrap_or_else(|| player.to_string());
-
-    let channel = if args.stream.contains('/') {
-        args.stream.split('/').last().unwrap()
-    } else {
-        args.stream.as_str()
-    };
-
-    let id = std::env::var("TWITCH_CLIENT_ID")
-        .abort(|_| "env. var 'TWITCH_CLIENT_ID' must be set to your client id".to_string());
-
-    let client = Client::new(id);
-    let streams = client.get(&channel).abort(|err| err.to_string());
-
-    let singular = args.quality.is_some();
-
-    let quality = args.quality.unwrap_or_else(|| Quality::Best);
-    let stream = match quality {
-        Quality::Best => streams
-            .first()
-            .abort(|_| format!("stream `{}` is offline", channel)),
-
-        Quality::Lowest => streams
-            .last()
-            .abort(|_| format!("stream `{}` is offline", channel)),
-
-        Quality::Custom(mut s) => {
-            if !s.ends_with('p') {
-                s.push('p');
-            }
-            streams
-                .iter()
-                .find(|stream| stream.ty == *s)
-                .abort(|_| format!("quality `{}` is not available for stream `{}` ", s, channel))
-        }
-    };
-
-    if args.json && !args.list {
-        let s = if !singular {
-            serde_json::to_string(&streams).unwrap()
-        } else {
-            serde_json::to_string(&stream).unwrap()
-        };
-        println!("{}", s);
-        return;
-    }
-
-    match (args.json, args.list, singular) {
-        (false, true, false) => streams
-            .into_iter()
-            .map(Item::from)
-            .for_each(|k| println!("{}", k)),
-
-        (false, true, true) => println!("{}", Item::from(stream.clone())),
-
-        (true, true, true) => println!(
-            "{}",
-            serde_json::to_string(&Item::from(stream.clone())).unwrap()
-        ),
-
-        (true, true, false) => println!(
-            "{}",
-            serde_json::to_string(
-                &streams.into_iter().map(Item::from).collect::<Vec<_>>() //
-            )
-            .unwrap()
-        ),
-
-        _ => std::process::Command::new(player)
-            .arg(&stream.link)
-            .spawn()
-            .map(|_| ())
-            .abort(|err| format!("cannot start stream `{}`: {}", channel, err)),
     }
 }
 
@@ -360,5 +251,121 @@ impl<T> Abort<T, ()> for Option<T> {
             eprintln!("{}", f(()));
             std::process::exit(1);
         })
+    }
+}
+
+#[derive(Options, Debug, Clone)]
+struct Args {
+    #[options(help = "display this message")]
+    help: bool,
+
+    #[options(help = "dumps the stream information as json")]
+    json: bool,
+
+    #[options(help = "a player to use.")]
+    player: Option<String>,
+
+    #[options(help = "desired quality of the stream")]
+    quality: Option<Quality>,
+
+    #[options(help = "list stream quality information")]
+    list: bool,
+
+    #[options(required, free, help = "the stream to fetch")]
+    stream: String,
+}
+
+fn main() {
+    let player = std::env::var("STREAMLINK_PLAYER")
+        .ok()
+        .unwrap_or_else(|| "mpv".to_string());
+
+    // TODO show the version
+    let args = Args::parse_args_default_or_exit();
+
+    let player = args.player.unwrap_or_else(|| player.to_string());
+    if std::fs::metadata(&player).is_err() {
+        eprintln!("error: invalid path: {}. set `STREAMLINK_PLAYER` or provide a path to a valid executable", player);
+        std::process::exit(1);
+    }
+
+    let channel = if args.stream.contains('/') {
+        args.stream.split('/').last().unwrap()
+    } else {
+        args.stream.as_str()
+    };
+
+    let id = std::env::var("TWITCH_CLIENT_ID")
+        .abort(|_| "env. var 'TWITCH_CLIENT_ID' must be set to your client id".to_string());
+
+    let client = Client::new(id);
+    let streams = client.get(&channel).abort(|err| err.to_string());
+
+    let singular = args.quality.is_some();
+
+    let quality = args.quality.unwrap_or_else(|| Quality::Best);
+    let stream = match quality {
+        Quality::Best => streams
+            .first()
+            .abort(|_| format!("stream `{}` is offline", channel)),
+
+        Quality::Lowest => streams
+            .last()
+            .abort(|_| format!("stream `{}` is offline", channel)),
+
+        Quality::Custom(mut s) => {
+            if !s.ends_with('p') {
+                s.push('p');
+            }
+            streams
+                .iter()
+                .find(|stream| stream.ty == *s)
+                .abort(|_| format!("quality `{}` is not available for stream `{}` ", s, channel))
+        }
+    };
+
+    if args.json && !args.list {
+        let s = if !singular {
+            serde_json::to_string(&streams)
+        } else {
+            serde_json::to_string(&stream)
+        }
+        .unwrap();
+
+        println!("{}", s);
+        return;
+    }
+
+    match (args.json, args.list, singular) {
+        (false, true, false) => streams
+            .into_iter()
+            .map(Item::from)
+            .for_each(|k| println!("{}", k)),
+
+        (false, true, true) => println!("{}", Item::from(stream.clone())),
+
+        (true, true, true) => println!(
+            "{}",
+            serde_json::to_string(&Item::from(stream.clone())).unwrap()
+        ),
+
+        (true, true, false) => println!(
+            "{}",
+            serde_json::to_string(
+                &streams.into_iter().map(Item::from).collect::<Vec<_>>() //
+            )
+            .unwrap()
+        ),
+
+        _ => std::process::Command::new(&player)
+            .arg(&stream.link)
+            .spawn()
+            .map(|_| ())
+            .abort(|err| {
+                format!(
+                    "cannot start stream `{}`. make sure `{}` is a valid player\nerror: {}",
+                    channel, player, err
+                )
+            }),
     }
 }
