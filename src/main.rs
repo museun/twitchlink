@@ -4,38 +4,26 @@ use std::collections::HashMap;
 
 #[derive(Debug, thiserror::Error)]
 enum Error {
-    #[error("cannot get access token for '{channel}' because: {source}")]
-    GetAccessToken {
-        channel: String,
-        source: attohttpc::Error,
-    },
+    #[error("cannot get access token because: {0}")]
+    GetAccessToken(#[source] attohttpc::Error),
 
-    #[error("cannot deserialize response for '{channel}' because: {source}")]
-    Deserialize {
-        channel: String,
-        source: attohttpc::Error,
-    },
+    #[error("cannot deserialize response because: {0}")]
+    Deserialize(#[source] attohttpc::Error),
 
-    #[error("cannot get playlist for '{channel}' because: {source}")]
-    GetPlaylist {
-        channel: String,
-        source: attohttpc::Error,
-    },
+    #[error("cannot get playlist because: {0}")]
+    GetPlaylist(#[source] attohttpc::Error),
 
-    #[error("cannot get response body for '{channel}' because: {source}")]
-    GetResponseBody {
-        channel: String,
-        source: attohttpc::Error,
-    },
+    #[error("cannot get response body because: {0}")]
+    GetResponseBody(#[source] attohttpc::Error),
 
-    #[error("cannot playlist for '{channel}'")]
-    InvalidPlaylist { channel: String },
+    #[error("cannot playlist")]
+    InvalidPlaylist,
 
-    #[error("cannot find token for '{channel}'")]
-    FindToken { channel: String },
+    #[error("cannot find token")]
+    FindToken,
 
-    #[error("cannot find signature for '{channel}'")]
-    FindSignature { channel: String },
+    #[error("cannot find signature")]
+    FindSignature,
 }
 
 struct Client {
@@ -61,12 +49,10 @@ impl Client {
 
         for line in playlist.lines() {
             if line.contains("VIDEO=") {
-                let (index, _) =
-                    line.match_indices("VIDEO=")
-                        .next()
-                        .ok_or_else(|| Error::InvalidPlaylist {
-                            channel: channel.to_string(),
-                        })?;
+                let (index, _) = line
+                    .match_indices("VIDEO=")
+                    .next()
+                    .ok_or_else(|| Error::InvalidPlaylist)?;
 
                 quality = line[index + "VIDEO=".len()..].replace("\"", "");
 
@@ -126,31 +112,17 @@ impl Client {
         ))
         .header("Client-ID", self.client_id.clone())
         .send()
-        .map_err(|err| Error::GetAccessToken {
-            channel: channel.to_string(),
-            source: err,
-        })?
+        .map_err(Error::GetAccessToken)?
         .json()
-        .map_err(|err| Error::Deserialize {
-            channel: channel.to_string(),
-            source: err,
-        })?;
+        .map_err(Error::Deserialize)?;
 
         let (token, sig) = match (
             val.get("token").and_then(serde_json::Value::as_str),
             val.get("sig").and_then(serde_json::Value::as_str),
         ) {
             (Some(token), Some(sig)) => (token, sig),
-            (None, ..) => {
-                return Err(Error::FindToken {
-                    channel: channel.to_string(),
-                })
-            }
-            (.., None) => {
-                return Err(Error::FindSignature {
-                    channel: channel.to_string(),
-                })
-            }
+            (None, ..) => return Err(Error::FindToken),
+            (.., None) => return Err(Error::FindSignature),
         };
 
         attohttpc::get(format!(
@@ -166,15 +138,9 @@ impl Client {
             ("allow_source", "true"),
         ])
         .send()
-        .map_err(|err| Error::GetPlaylist {
-            channel: channel.to_string(),
-            source: err,
-        })?
+        .map_err(Error::GetPlaylist)?
         .text()
-        .map_err(|err| Error::GetResponseBody {
-            channel: channel.to_string(),
-            source: err,
-        })
+        .map_err(Error::GetResponseBody)
     }
 }
 
