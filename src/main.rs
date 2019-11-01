@@ -293,11 +293,6 @@ fn main() {
     let args = Args::parse_args_default_or_exit();
 
     let player = args.player.unwrap_or_else(|| player.to_string());
-    if std::fs::metadata(&player).is_err() {
-        eprintln!("error: invalid path: {}. set `STREAMLINK_PLAYER` or provide a path to a valid executable", player);
-        std::process::exit(1);
-    }
-
     let channel = if args.stream.contains('/') {
         args.stream.split('/').last().unwrap()
     } else {
@@ -366,15 +361,21 @@ fn main() {
             .unwrap()
         ),
 
-        _ => std::process::Command::new(&player)
-            .arg(&stream.link)
-            .spawn()
-            .map(|_| ())
-            .abort(|err| {
-                format!(
-                    "cannot start stream `{}`. make sure `{}` is a valid player\nerror: {}",
-                    channel, player, err
-                )
-            }),
+        _ => {
+            if std::fs::metadata(&player).is_err() {
+                eprintln!("error: invalid path: {}. set `STREAMLINK_PLAYER` or provide a path to a valid executable", player);
+                std::process::exit(1);
+            }
+            std::process::Command::new(&player)
+                .arg(&stream.link)
+                .spawn()
+                .map(|_| ())
+                .abort(|err| {
+                    format!(
+                        "cannot start stream `{}`. make sure `{}` is a valid player\nerror: {}",
+                        channel, player, err
+                    )
+                })
+        }
     }
 }
