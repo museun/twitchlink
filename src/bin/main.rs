@@ -17,10 +17,6 @@ impl<T> Abort<T, ()> for Option<T> {
     }
 }
 
-fn error(msg: impl std::fmt::Display) {
-    eprintln!("error: {}", msg);
-}
-
 fn fatal(msg: impl std::fmt::Display) -> ! {
     eprintln!("fatal error: {}", msg);
     std::process::exit(1)
@@ -81,24 +77,25 @@ fn main() {
 
     let streams = client::get(&id, &channel).unwrap_or_abort(|err| err);
 
+    if streams.is_empty() {
+        fatal(format!("stream `{}` is offline", channel))
+    }
+
     let stream = match quality {
-        Quality::Best => streams
-            .first()
-            .unwrap_or_abort(|_| format!("stream `{}` is offline", channel)),
-
-        Quality::Lowest => streams
-            .last()
-            .unwrap_or_abort(|_| format!("stream `{}` is offline", channel)),
-
-        Quality::Custom(mut s) => {
-            if !s.ends_with('p') {
-                s.push('p');
+        Quality::Best => streams.first().unwrap(),
+        Quality::Worst => streams.last().unwrap(),
+        Quality::Custom(mut stream) => {
+            if !stream.ends_with('p') {
+                stream.push('p');
             }
             streams
                 .iter()
-                .find(|stream| stream.ty == *s)
+                .find(|s| s.ty == *stream)
                 .unwrap_or_abort(|_| {
-                    format!("quality `{}` is not available for stream `{}` ", s, channel)
+                    format!(
+                        "quality `{}` is not available for stream `{}` ",
+                        stream, channel
+                    )
                 })
         }
     };

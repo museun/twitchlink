@@ -126,7 +126,7 @@ pub struct Stream {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Quality {
     Best,
-    Lowest,
+    Worst,
     Custom(String),
 }
 
@@ -136,7 +136,7 @@ impl std::str::FromStr for Quality {
         let input = s.to_ascii_lowercase();
         let ok = match input.as_str() {
             "best" | "highest" => Quality::Best,
-            "worst" | "lowest " => Quality::Lowest,
+            "worst" | "lowest " => Quality::Worst,
             _ => Quality::Custom(input), // try parsing this maybe
         };
         Ok(ok)
