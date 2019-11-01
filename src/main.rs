@@ -267,7 +267,7 @@ struct Args {
     #[options(help = "dumps the stream information as json")]
     json: bool,
 
-    #[options(help = "a player to use.")]
+    #[options(help = "a player to use. defaults to mpv")]
     player: Option<String>,
 
     #[options(help = "desired quality of the stream")]
@@ -281,9 +281,13 @@ struct Args {
 }
 
 fn main() {
-    let player = std::env::var("STREAMLINK_PLAYER")
-        .ok()
-        .unwrap_or_else(|| "mpv".to_string());
+    let player = std::env::var("STREAMLINK_PLAYER").ok().unwrap_or_else(|| {
+        if cfg!(not(windows)) {
+            "/usr/bin/mpv".to_string()
+        } else {
+            "mpv".to_string()
+        }
+    });
 
     // TODO show the version
     let args = Args::parse_args_default_or_exit();
